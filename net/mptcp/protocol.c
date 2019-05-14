@@ -48,15 +48,126 @@ static struct sock *mptcp_subflow_get_ref(const struct mptcp_sock *msk)
 	return NULL;
 }
 
+static inline bool mptcp_skb_can_collapse_to(const struct mptcp_sock *msk,
+					     const struct sk_buff *skb,
+					     const struct mptcp_ext *mpext)
+{
+	if (!tcp_skb_can_collapse_to(skb))
+		return false;
+
+	/* can collapse only if MPTCP level sequence is in order */
+	return mpext && mpext->data_seq + mpext->data_len == msk->write_seq;
+}
+
+static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+			      struct msghdr *msg, long *timeo, int *pmss_now,
+			      int *ps_goal)
+{
+	int mss_now, avail_size, size_goal, ret;
+	struct mptcp_sock *msk = mptcp_sk(sk);
+	bool collapsed, can_collapse = false;
+	struct mptcp_ext *mpext = NULL;
+	struct page_frag *pfrag;
+	struct sk_buff *skb;
+	size_t psize;
+
+	/* use the mptcp page cache so that we can easily move the data
+	 * from one substream to another, but do per subflow memory accounting
+	 */
+	pfrag = sk_page_frag(sk);
+	while (!sk_page_frag_refill(ssk, pfrag)) {
+		ret = sk_stream_wait_memory(ssk, timeo);
+		if (ret)
+			return ret;
+	}
+
+	/* compute copy limit */
+	mss_now = tcp_send_mss(ssk, &size_goal, msg->msg_flags);
+	*pmss_now = mss_now;
+	*ps_goal = size_goal;
+	avail_size = size_goal;
+	skb = tcp_write_queue_tail(ssk);
+	if (skb) {
+		mpext = skb_ext_find(skb, SKB_EXT_MPTCP);
+
+		/* Limit the write to the size available in the
+		 * current skb, if any, so that we create at most a new skb.
+		 * If we run out of space in the current skb (e.g. the window
+		 * size shrunk from last sent) a new skb will be allocated even
+		 * is collapsing was allowed: collapsing is effectively
+		 * disabled.
+		 */
+		can_collapse = mptcp_skb_can_collapse_to(msk, skb, mpext);
+		if (!can_collapse)
+			TCP_SKB_CB(skb)->eor = 1;
+		else if (size_goal - skb->len > 0)
+			avail_size = size_goal - skb->len;
+		else
+			can_collapse = false;
+	}
+	psize = min_t(size_t, pfrag->size - pfrag->offset, avail_size);
+
+	/* Copy to page */
+	pr_debug("left=%zu", msg_data_left(msg));
+	psize = copy_page_from_iter(pfrag->page, pfrag->offset,
+				    min_t(size_t, msg_data_left(msg), psize),
+				    &msg->msg_iter);
+	pr_debug("left=%zu", msg_data_left(msg));
+	if (!psize)
+		return -EINVAL;
+
+	/* tell the TCP stack to delay the push so that we can safely
+	 * access the skb after the sendpages call
+	 */
+	ret = do_tcp_sendpages(ssk, pfrag->page, pfrag->offset, psize,
+			       msg->msg_flags | MSG_SENDPAGE_NOTLAST);
+	if (ret <= 0)
+		return ret;
+	if (unlikely(ret < psize))
+		iov_iter_revert(&msg->msg_iter, psize - ret);
+
+	collapsed = skb == tcp_write_queue_tail(ssk);
+	BUG_ON(collapsed && !can_collapse);
+	if (collapsed) {
+		/* when collapsing mpext always exists */
+		mpext->data_len += ret;
+		goto out;
+	}
+
+	skb = tcp_write_queue_tail(ssk);
+	mpext = skb_ext_add(skb, SKB_EXT_MPTCP);
+	if (mpext) {
+		memset(mpext, 0, sizeof(*mpext));
+		mpext->data_seq = msk->write_seq;
+		mpext->subflow_seq = subflow_ctx(ssk)->rel_write_seq;
+		mpext->data_len = ret;
+		mpext->checksum = 0xbeef;
+		mpext->use_map = 1;
+		mpext->dsn64 = 1;
+
+		pr_debug("data_seq=%llu subflow_seq=%u data_len=%u checksum=%u, dsn64=%d",
+			 mpext->data_seq, mpext->subflow_seq, mpext->data_len,
+			 mpext->checksum, mpext->dsn64);
+	}
+	/* TODO: else fallback; allocation can fail, but we can't easily retire
+	 * skbs from the write_queue, as we need to roll-back TCP status
+	 */
+
+out:
+	pfrag->offset += ret;
+	msk->write_seq += ret;
+	subflow_ctx(ssk)->rel_write_seq += ret;
+
+	return ret;
+}
+
 static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 {
+	int mss_now = 0, size_goal = 0, ret = 0;
 	struct mptcp_sock *msk = mptcp_sk(sk);
-	int mss_now, size_goal, poffset, ret;
-	struct mptcp_ext *mpext = NULL;
-	struct page *page = NULL;
-	struct sk_buff *skb;
+	size_t copied = 0;
 	struct sock *ssk;
-	size_t psize;
+	long timeo;
 
 	pr_debug("msk=%p", msk);
 	if (msk->subflow) {
@@ -81,82 +192,27 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		goto put_out;
 	}
 
-	/* Initial experiment: new page per send.  Real code will
-	 * maintain list of active pages and DSS mappings, append to the
-	 * end and honor zerocopy
-	 */
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		ret = -ENOMEM;
-		goto put_out;
-	}
-
-	/* Copy to page */
-	poffset = 0;
-	pr_debug("left=%zu", msg_data_left(msg));
-	psize = copy_page_from_iter(page, poffset,
-				    min_t(size_t, msg_data_left(msg),
-					  PAGE_SIZE),
-				    &msg->msg_iter);
-	pr_debug("left=%zu", msg_data_left(msg));
-
-	if (!psize) {
-		ret = -EINVAL;
-		goto put_out;
-	}
-
 	lock_sock(sk);
 	lock_sock(ssk);
+	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+	while (msg_data_left(msg)) {
+		ret = mptcp_sendmsg_frag(sk, ssk, msg, &timeo, &mss_now,
+					 &size_goal);
+		if (ret < 0)
+			break;
 
-	/* Mark the end of the previous write so the beginning of the
-	 * next write (with its own mptcp skb extension data) is not
-	 * collapsed.
-	 */
-	skb = tcp_write_queue_tail(ssk);
-	if (skb)
-		TCP_SKB_CB(skb)->eor = 1;
+		copied += ret;
+	}
+	if (copied) {
+		ret = copied;
+		tcp_push(ssk, msg->msg_flags, mss_now, tcp_sk(ssk)->nonagle,
+			 size_goal);
+	}
 
-	mss_now = tcp_send_mss(ssk, &size_goal, msg->msg_flags);
-
-	ret = do_tcp_sendpages(ssk, page, poffset, min_t(int, size_goal, psize),
-			       msg->msg_flags | MSG_SENDPAGE_NOTLAST);
-	if (ret <= 0)
-		goto release_out;
-
-	if (skb == tcp_write_queue_tail(ssk))
-		pr_err("no new skb %p/%p", sk, ssk);
-
-	skb = tcp_write_queue_tail(ssk);
-
-	mpext = skb_ext_add(skb, SKB_EXT_MPTCP);
-
-	if (mpext) {
-		memset(mpext, 0, sizeof(*mpext));
-		mpext->data_seq = msk->write_seq;
-		mpext->subflow_seq = subflow_ctx(ssk)->rel_write_seq;
-		mpext->data_len = ret;
-		mpext->checksum = 0xbeef;
-		mpext->use_map = 1;
-		mpext->dsn64 = 1;
-
-		pr_debug("data_seq=%llu subflow_seq=%u data_len=%u checksum=%u, dsn64=%d",
-			 mpext->data_seq, mpext->subflow_seq, mpext->data_len,
-			 mpext->checksum, mpext->dsn64);
-	} /* TODO: else fallback */
-
-	msk->write_seq += ret;
-	subflow_ctx(ssk)->rel_write_seq += ret;
-
-	tcp_push(ssk, msg->msg_flags, mss_now, tcp_sk(ssk)->nonagle, size_goal);
-
-release_out:
 	release_sock(ssk);
 	release_sock(sk);
 
 put_out:
-	if (page)
-		put_page(page);
-
 	sock_put(ssk);
 	return ret;
 }
@@ -490,18 +546,31 @@ static int mptcp_init_sock(struct sock *sk)
 
 	pr_debug("msk=%p", msk);
 
-	INIT_HLIST_HEAD(&msk->conn_list);
+	INIT_LIST_HEAD_RCU(&msk->conn_list);
 	spin_lock_init(&msk->conn_list_lock);
 
 	return 0;
 }
 
+static void mptcp_flush_conn_list(struct sock *sk, struct list_head *list)
+{
+	struct mptcp_sock *msk = mptcp_sk(sk);
+
+	INIT_LIST_HEAD_RCU(list);
+	spin_lock_bh(&msk->conn_list_lock);
+	list_splice_init(&msk->conn_list, list);
+	spin_unlock_bh(&msk->conn_list_lock);
+
+	if (!list_empty(list))
+		synchronize_rcu();
+}
+
 static void mptcp_close(struct sock *sk, long timeout)
 {
 	struct mptcp_sock *msk = mptcp_sk(sk);
-	struct hlist_node *node;
+	struct subflow_context *subflow, *tmp;
 	struct socket *ssk = NULL;
-	struct subflow_context *subflow;
+	struct list_head list;
 
 	spin_lock_bh(&msk->conn_list_lock);
 	if (msk->subflow) {
@@ -514,25 +583,18 @@ static void mptcp_close(struct sock *sk, long timeout)
 		sock_release(ssk);
 	}
 
-	do {
-		spin_lock_bh(&msk->conn_list_lock);
-		/* The spin lock was just acquired, so tell
-		 * rcu_dereference_check() this access to the list is properly
-		 * protected even though the rcu_read_lock is not held.
-		 */
-		node = rcu_dereference_check(hlist_first_rcu(&msk->conn_list),
-					spin_is_locked(&msk->conn_list_lock) ||
-					!IS_ENABLED(CONFIG_SMP));
-		if (!node)
-			break;
-		subflow = hlist_entry(node, struct subflow_context, node);
-		hlist_del_rcu(node);
-		spin_unlock_bh(&msk->conn_list_lock);
-		synchronize_rcu();
+	/* this is the only place where we can remove any entry from the
+	 * conn_list. Additionally acquiring the socket lock here
+	 * allows for mutual exclusion with mptcp_shutdown().
+	 */
+	lock_sock(sk);
+	mptcp_flush_conn_list(sk, &list);
+	release_sock(sk);
+
+	list_for_each_entry_safe(subflow, tmp, &list, node) {
 		pr_debug("conn_list->subflow=%p", subflow);
 		sock_release(sock_sk(subflow)->sk_socket);
-	} while (1);
-	spin_unlock_bh(&msk->conn_list_lock);
+	};
 }
 
 static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,
@@ -571,7 +633,7 @@ static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,
 		pr_debug("token=%u", msk->token);
 		token_update_accept(new_sock->sk, new_mptcp_sock->sk);
 		spin_lock_bh(&msk->conn_list_lock);
-		hlist_add_head_rcu(&subflow->node, &msk->conn_list);
+		list_add_rcu(&subflow->node, &msk->conn_list);
 		msk->subflow = NULL;
 		spin_unlock_bh(&msk->conn_list_lock);
 
@@ -670,7 +732,7 @@ void mptcp_finish_connect(struct sock *sk, int mp_capable)
 		msk->token = subflow->token;
 		pr_debug("token=%u", msk->token);
 		spin_lock_bh(&msk->conn_list_lock);
-		hlist_add_head_rcu(&subflow->node, &msk->conn_list);
+		list_add_rcu(&subflow->node, &msk->conn_list);
 		msk->subflow = NULL;
 		spin_unlock_bh(&msk->conn_list_lock);
 
@@ -881,12 +943,23 @@ static int mptcp_shutdown(struct socket *sock, int how)
 		return kernel_sock_shutdown(msk->subflow, how);
 	}
 
+	/* protect against concurrent mptcp_close(), so that nobody can
+	 * remove entries from the conn list and walking the list breaking
+	 * the RCU critical section is still safe. We need to release the
+	 * RCU lock to call the blocking kernel_sock_shutdown() primitive
+	 * Note: we can't use MPTCP socket lock to protect conn_list changes,
+	 * as we need to update it from the BH via the mptcp_finish_connect()
+	 */
+	lock_sock(sock->sk);
 	rcu_read_lock();
-	mptcp_for_each_subflow(msk, subflow) {
+	list_for_each_entry_rcu(subflow, &msk->conn_list, node) {
+		rcu_read_unlock();
 		pr_debug("conn_list->subflow=%p", subflow);
 		ret = kernel_sock_shutdown(sock_sk(subflow)->sk_socket, how);
+		rcu_read_lock();
 	}
 	rcu_read_unlock();
+	release_sock(sock->sk);
 
 	return ret;
 }
